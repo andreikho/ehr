@@ -160,8 +160,15 @@ def create_tf_numeric_feature(col, MEAN, STD, default_value=0):
         tf_numeric_feature: tf feature column representation of the input field
     '''
     # Create normalizer function
+    # Note: Handles std=0 (constant columns) and type mismatches to prevent NaN/Inf
     def zscore_normalizer(col_value):
-        return (col_value - MEAN) / STD
+        # Cast to float32 to fix int64/float32 type mismatch from dataset
+        col_value = tf.cast(col_value, tf.float32)
+        std_tensor = tf.constant(STD, dtype=tf.float32)
+        mean_tensor = tf.constant(MEAN, dtype=tf.float32)
+        # Use safe_std to prevent division by zero for constant columns (std=0)
+        safe_std = tf.maximum(std_tensor, 1e-6)
+        return (col_value - mean_tensor) / safe_std
     
     # Create numeric column with normalization
     tf_numeric_feature = tf.feature_column.numeric_column(
