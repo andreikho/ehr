@@ -1,3 +1,7 @@
 diabetes+130-us+hospitals+for+years+1999-2008/
 venv/
 .ipynb_checkpoints/
+data/
+diabetes_vocab/
+__pycache__/
+medication_lookup_tables/

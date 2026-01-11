@@ -1,199 +1,204 @@
-"""
-Utility functions for EHR data processing and TensorFlow dataset creation.
-"""
-
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from typing import Dict, List, Tuple, Optional
+import tensorflow_probability as tfp
+import os
+from student_utils import create_tf_numeric_feature
 
-
-def load_data(data_path: str) -> pd.DataFrame:
-    """
-    Load the diabetic data CSV file.
+def aggregate_dataset(df, grouping_field_list, array_field):
+    """Aggregate dataset by grouping fields and create dummy columns for array field.
     
-    Args:
-        data_path: Path to the diabetic_data.csv file
+    Groups by encounter_id and aggregates drug names into dummy columns.
+    Other fields take their first value (should be constant within encounter).
+    """
+    # Use encounter_id as the primary grouping key
+    key_field = 'encounter_id'
+    
+    # Fields that should take first value (constant within encounter)
+    other_fields = [c for c in grouping_field_list if c != key_field and c != 'ndc_code']
+    
+    # Build aggregation dict
+    agg_dict = {array_field: list}  # Collect drugs as list
+    for field in other_fields:
+        agg_dict[field] = 'first'  # Take first value
+    
+    # Group by encounter_id and aggregate
+    agg_df = df.groupby(key_field, as_index=False).agg(agg_dict)
+    agg_df = agg_df.rename(columns={array_field: array_field + "_array"})
+    
+    # Create dummy columns from the array field (one-hot encoding of drugs)
+    drug_series = agg_df[array_field + '_array'].apply(pd.Series).stack()
+    if len(drug_series) > 0:
+        dummy_df = pd.get_dummies(drug_series).groupby(level=0).sum()
+        # Clean column names (replace spaces with underscores)
+        dummy_col_list = [str(x).replace(" ", "_") for x in list(dummy_df.columns)]
+        dummy_df.columns = dummy_col_list
+    else:
+        dummy_df = pd.DataFrame()
+        dummy_col_list = []
+    
+    # Concatenate the aggregated dataframe with dummy columns
+    concat_df = pd.concat([agg_df.reset_index(drop=True), dummy_df.reset_index(drop=True)], axis=1)
+    
+    # Clean all column names
+    new_col_list = [str(x).replace(" ", "_") for x in list(concat_df.columns)]
+    concat_df.columns = new_col_list
+
+    return concat_df, dummy_col_list
+
+def cast_df(df, col, d_type=str):
+    return df[col].astype(d_type)
+
+def impute_df(df, col, impute_value=0):
+    return df[col].fillna(impute_value)
+    
+def preprocess_df(df, categorical_col_list, numerical_col_list, predictor, categorical_impute_value='nan',             numerical_impute_value=0):
+    df = df.copy()  # Avoid SettingWithCopyWarning by working with a copy
+    df[predictor] = df[predictor].astype(float)
+    for c in categorical_col_list:
+        df[c] = cast_df(df, c, d_type=str)
+    for numerical_column in numerical_col_list:
+        df[numerical_column] = impute_df(df, numerical_column, numerical_impute_value)
+    return df
+
+#adapted from https://www.tensorflow.org/tutorials/structured_data/feature_columns
+def df_to_dataset(df, predictor,  batch_size=32):
+    df = df.copy()
+    labels = df.pop(predictor)
+    ds = tf.data.Dataset.from_tensor_slices((dict(df), labels))
+    ds = ds.shuffle(buffer_size=len(df))
+    ds = ds.batch(batch_size)
+    return ds
+
+# build vocab for categorical features
+def write_vocabulary_file(vocab_list, field_name, default_value, vocab_dir='./diabetes_vocab/'):
+    # Create directory if it doesn't exist
+    os.makedirs(vocab_dir, exist_ok=True)
+    output_file_path = os.path.join(vocab_dir, str(field_name) + "_vocab.txt")
+    # put default value in first row as TF requires
+    vocab_list = np.insert(vocab_list, 0, default_value, axis=0) 
+    df = pd.DataFrame(vocab_list).to_csv(output_file_path, index=None, header=None)
+    return output_file_path
+
+def build_vocab_files(df, categorical_column_list, default_value='00'):
+    vocab_files_list = []
+    for c in categorical_column_list:
+        v_file = write_vocabulary_file(df[c].unique(), c, default_value)
+        vocab_files_list.append(v_file)
+    return vocab_files_list
+
+def show_group_stats_viz(df, group):
+    print(df.groupby(group).size())
+    print(df.groupby(group).size().plot(kind='barh'))
+ 
+'''
+Adapted from Tensorflow Probability Regression tutorial  https://github.com/tensorflow/probability/blob/master/tensorflow_probability/examples/jupyter_notebooks/Probabilistic_Layers_Regression.ipynb    
+'''
+def posterior_mean_field(kernel_size, bias_size=0, dtype=None):
+    n = kernel_size + bias_size
+    c = np.log(np.expm1(1.))
+    return tf.keras.Sequential([
+        tfp.layers.VariableLayer(2*n, dtype=dtype),
+        tfp.layers.DistributionLambda(lambda t: tfp.distributions.Independent(
+            tfp.distributions.Normal(loc=t[..., :n],
+                                     scale=1e-5 + tf.nn.softplus(c + t[..., n:])),
+            reinterpreted_batch_ndims=1)),
+    ])
+
+
+def prior_trainable(kernel_size, bias_size=0, dtype=None):
+    n = kernel_size + bias_size
+    return tf.keras.Sequential([
+        tfp.layers.VariableLayer(n, dtype=dtype),
+        tfp.layers.DistributionLambda(lambda t: tfp.distributions.Independent(
+            tfp.distributions.Normal(loc=t, scale=1),
+            reinterpreted_batch_ndims=1)),
+    ])
+
+def demo(feature_column, example_batch):
+    """
+    Demo function to test a feature column.
+    Uses DenseFeaturesCompat for TensorFlow 2.20+ compatibility.
+    """
+    feature_layer = DenseFeaturesCompat([feature_column])
+    print(feature_layer(example_batch))
+    return feature_layer(example_batch)
+
+def calculate_stats_from_train_data(df, col):
+    mean = df[col].describe()['mean']
+    std = df[col].describe()['std']
+    return mean, std
+
+def create_tf_numerical_feature_cols(numerical_col_list, train_df):
+    tf_numeric_col_list = []
+    for c in numerical_col_list:
+        mean, std = calculate_stats_from_train_data(train_df, c)
+        tf_numeric_feature = create_tf_numeric_feature(c, mean, std)
+        tf_numeric_col_list.append(tf_numeric_feature)
+    return tf_numeric_col_list
+
+
+# ============================================================================
+# DenseFeatures Compatibility Layer for TensorFlow 2.20+
+# ============================================================================
+
+class DenseFeaturesCompat(tf.keras.layers.Layer):
+    """
+    Compatibility layer to replace tf.keras.layers.DenseFeatures (removed in TF 2.20+).
+    
+    This layer transforms TensorFlow feature columns into dense tensors, maintaining
+    compatibility with the existing feature column API from the Udacity course.
+    
+    Why this alternative?
+    ---------------------
+    1. **API Compatibility**: Maintains compatibility with existing feature column code,
+       avoiding a complete rewrite of feature engineering logic that uses vocabulary files
+       and the feature column API.
+    
+    2. **Direct Feature Column Transformation**: Uses TensorFlow's feature column
+       transformation API directly, which still works even though DenseFeatures wrapper
+       was removed. This preserves the exact same transformations (normalization,
+       vocabulary lookup, one-hot encoding) as the original DenseFeatures.
+    
+    3. **Seamless Integration**: Drop-in replacement for DenseFeatures - existing model
+       architectures don't need to change, just replace:
+       `tf.keras.layers.DenseFeatures(feature_columns)` 
+       with 
+       `DenseFeaturesCompat(feature_columns)`
+    
+    4. **Future-Proof**: While TensorFlow recommends migrating to Keras preprocessing layers
+       long-term, this compatibility layer allows the course code to work immediately with
+       modern TensorFlow versions while maintaining the same feature engineering approach.
+    
+    Technical Approach:
+    ------------------
+    The layer uses the internal input_layer function from tensorflow.python.feature_column
+    which is the underlying function that DenseFeatures used. While the public API was
+    removed in TF 2.20+, the internal implementation still exists and works. We wrap it
+    in a Keras layer to maintain the same API as the original DenseFeatures.
+    
+    Note: This uses an internal TensorFlow API which may change in future versions.
+    For production code, consider migrating to Keras preprocessing layers long-term.
+    
+    Usage:
+        # Old (TF < 2.20):
+        # feature_layer = tf.keras.layers.DenseFeatures(feature_columns)
         
-    Returns:
-        DataFrame containing the loaded data
+        # New (TF 2.20+):
+        feature_layer = DenseFeaturesCompat(feature_columns)
     """
-    return pd.read_csv(data_path)
-
-
-def load_mapping(mapping_path: str) -> pd.DataFrame:
-    """
-    Load the IDS mapping CSV file.
     
-    Args:
-        mapping_path: Path to the IDS_mapping.csv file
+    def __init__(self, feature_columns, name='dense_features_compat', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.feature_columns = feature_columns
         
-    Returns:
-        DataFrame containing the mapping data
-    """
-    return pd.read_csv(mapping_path)
-
-
-def z_score_normalizer(mean: float, std: float) -> callable:
-    """
-    Create a z-score normalizer function.
-    
-    Args:
-        mean: Mean value for normalization
-        std: Standard deviation for normalization
-        
-    Returns:
-        Normalizer function that takes a value and returns normalized value
-    """
-    def normalize(value):
-        if std == 0:
-            return 0.0
-        return (value - mean) / std
-    
-    return normalize
-
-
-def split_dataset_by_patient(
-    df: pd.DataFrame,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    random_state: int = 42
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Split dataset into train, validation, and test sets by patient_nbr.
-    This ensures no data leakage between splits.
-    
-    Args:
-        df: DataFrame with patient_nbr column
-        train_ratio: Proportion of patients for training
-        val_ratio: Proportion of patients for validation
-        test_ratio: Proportion of patients for testing
-        random_state: Random seed for reproducibility
-        
-    Returns:
-        Tuple of (train_df, val_df, test_df)
-    """
-    # Get unique patients
-    unique_patients = df['patient_nbr'].unique()
-    np.random.seed(random_state)
-    np.random.shuffle(unique_patients)
-    
-    # Calculate split indices
-    n_patients = len(unique_patients)
-    train_end = int(n_patients * train_ratio)
-    val_end = train_end + int(n_patients * val_ratio)
-    
-    # Split patients
-    train_patients = unique_patients[:train_end]
-    val_patients = unique_patients[train_end:val_end]
-    test_patients = unique_patients[val_end:]
-    
-    # Split dataframe by patient
-    train_df = df[df['patient_nbr'].isin(train_patients)].copy()
-    val_df = df[df['patient_nbr'].isin(val_patients)].copy()
-    test_df = df[df['patient_nbr'].isin(test_patients)].copy()
-    
-    return train_df, val_df, test_df
-
-
-def create_tf_dataset(
-    df: pd.DataFrame,
-    feature_columns: List[tf.feature_column.FeatureColumn],
-    label_column: str,
-    batch_size: int = 32,
-    shuffle: bool = True,
-    shuffle_buffer_size: int = 10000
-) -> tf.data.Dataset:
-    """
-    Create a TensorFlow dataset from a pandas DataFrame.
-    
-    Args:
-        df: Input DataFrame
-        feature_columns: List of TensorFlow feature columns
-        label_column: Name of the label column
-        batch_size: Batch size for the dataset
-        shuffle: Whether to shuffle the dataset
-        shuffle_buffer_size: Buffer size for shuffling
-        
-    Returns:
-        TensorFlow Dataset
-    """
-    # Convert DataFrame to dictionary of tensors
-    features_dict = {}
-    for col in df.columns:
-        if col != label_column:
-            # Convert to numpy array and ensure proper dtype
-            features_dict[col] = df[col].values
-    
-    # Create dataset from dictionary
-    dataset = tf.data.Dataset.from_tensor_slices((features_dict, df[label_column].values))
-    
-    # Apply feature columns transformation
-    def map_features(features, label):
-        # Convert features dict to proper format for feature columns
-        dense_tensor = tf.feature_column.input_layer(features, feature_columns)
-        return dense_tensor, label
-    
-    dataset = dataset.map(map_features)
-    
-    # Shuffle if requested
-    if shuffle:
-        dataset = dataset.shuffle(shuffle_buffer_size)
-    
-    # Batch the dataset
-    dataset = dataset.batch(batch_size)
-    
-    return dataset
-
-
-def check_encounter_leakage(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame
-) -> bool:
-    """
-    Check if there's any encounter or patient leakage between splits.
-    
-    Args:
-        train_df: Training DataFrame
-        val_df: Validation DataFrame
-        test_df: Test DataFrame
-        
-    Returns:
-        True if no leakage detected, False otherwise
-    """
-    train_encounters = set(train_df['encounter_id'].unique())
-    train_patients = set(train_df['patient_nbr'].unique())
-    
-    val_encounters = set(val_df['encounter_id'].unique())
-    val_patients = set(val_df['patient_nbr'].unique())
-    
-    test_encounters = set(test_df['encounter_id'].unique())
-    test_patients = set(test_df['patient_nbr'].unique())
-    
-    # Check for encounter leakage
-    encounter_leakage = (
-        len(train_encounters & val_encounters) > 0 or
-        len(train_encounters & test_encounters) > 0 or
-        len(val_encounters & test_encounters) > 0
-    )
-    
-    # Check for patient leakage
-    patient_leakage = (
-        len(train_patients & val_patients) > 0 or
-        len(train_patients & test_patients) > 0 or
-        len(val_patients & test_patients) > 0
-    )
-    
-    if encounter_leakage:
-        print("WARNING: Encounter leakage detected!")
-        return False
-    
-    if patient_leakage:
-        print("WARNING: Patient leakage detected!")
-        return False
-    
-    print("✓ No data leakage detected between splits.")
-    return True
-
+    def call(self, inputs):
+        """
+        Transform feature columns to dense tensors.
+        Uses the internal input_layer function which still exists in the feature_column_lib.
+        This is the same underlying transformation that DenseFeatures used.
+        """
+        # Import the internal input_layer function
+        # This still exists even though the public API was removed
+        from tensorflow.python.feature_column import feature_column_lib as fc_lib
+        return fc_lib.input_layer(inputs, self.feature_columns)
