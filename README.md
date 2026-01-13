@@ -18,7 +18,9 @@ ehr/
 ├── medication_lookup_tables/
 │   └── final_ndc_lookup_table     # NDC code mappings
 ├── student_project_submission.ipynb  # My implementation (Gradient Boosting)
+├── student_project_submission.html   # HTML export of submission notebook
 ├── student_project_udacity.ipynb     # Udacity project exercises (TensorFlow NN)
+├── student_project_udacity.html      # HTML export of Udacity notebook
 ├── utils.py                          # Utility functions
 ├── student_utils.py                  # Student implementation functions
 └── requirements.txt                  # Python dependencies
@@ -29,10 +31,12 @@ ehr/
 ### My Implementation (Original Dataset)
 
 - **student_project_submission.ipynb**: My own implementation using the UCI Diabetes dataset (`diabetic_data.csv`). Uses Gradient Boosting Regressor after neural network attempts failed.
+- **student_project_submission.html**: HTML export of the submission notebook for easy viewing without running Jupyter.
 
 ### Udacity Project (Official Dataset)
 
 - **student_project_udacity.ipynb**: Implementation following Udacity's project structure using `final_project_dataset.csv`. Uses TensorFlow neural network with feature columns.
+- **student_project_udacity.html**: HTML export of the Udacity notebook for easy viewing without running Jupyter.
 
 ### Supporting Files
 
